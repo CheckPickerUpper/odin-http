@@ -78,6 +78,14 @@ Server_Listener_State :: enum u8 {
 	Closed,
 }
 
+@(private)
+Server_Wake_State :: enum u8 {
+	Unpublished,
+	Published,
+	Notifying,
+	Retired,
+}
+
 Server :: struct {
 	opts:           Server_Opts,
 	tcp_sock:       net.TCP_Socket,
@@ -85,13 +93,13 @@ Server :: struct {
 	handler:        Handler,
 
 	threads:        []Server_Thread,
-	// Once the server starts closing/shutdown this is set to true, all threads will check it
-	// and start their thread local shutdown procedure.
-	//
-	// NOTE: This is only ever set from false to true, and checked repeatedly,
-	// so it doesn't have to be atomic, this is purely to keep the thread sanitizer happy.
+	// Threads that publish their loop after shutdown starts observe closing before
+	// blocking, even when the notifier could not claim their unpublished loop.
 	closing:        Atomic(bool),
 	_listener:      Atomic(Server_Listener_State),
+	_shutdown_wake: Atomic(Server_Wake_State),
+	// Claimed loops and the thread slice stay live until notification finishes.
+	_shutdown_notified: sync.One_Shot_Event,
 	// Threads will decrement the wait group when they have fully closed/shutdown.
 	// The main thread waits on this to clean up global data and return.
 	threads_closed: sync.Wait_Group,
@@ -129,31 +137,75 @@ listen :: proc(
 	s: ^Server,
 	endpoint: net.Endpoint = Default_Endpoint,
 	opts: Server_Opts = Default_Server_Opts,
-) -> (err: net.Network_Error) {
-	s.opts = opts
-	s.conn_allocator = context.allocator
-	// initial_block_cap = int(s.opts.initial_temp_block_cap)
-	// max_free_blocks_queued = int(s.opts.max_free_blocks_queued)
-
+) -> net.Network_Error {
 	acquire_err := nbio.acquire_thread_event_loop()
 	// TODO: error handling.
 	assert(acquire_err == nil)
 
-	s.tcp_sock, err = nbio.listen_tcp(endpoint)
-	if err != nil {
+	socket, listen_error := nbio.listen_tcp(endpoint)
+	if listen_error != nil {
 		nbio.run()
 		nbio.release_thread_event_loop()
 		server_shutdown(s)
-	} else {
-		when ODIN_OS == .Linux {
-			atomic_store(&s._listener, .Listening)
-		}
+		return listen_error
 	}
-	return
+	_server_listener_init(s, socket, opts)
+	return nil
+}
+
+// The server owns the socket and one reference to its creator thread's event loop.
+Listening_On_Socket :: struct #all_or_none {}
+
+// The caller still owns the socket when its event loop cannot be acquired.
+Listener_Event_Loop_Unavailable :: struct #all_or_none {
+	socket: net.TCP_Socket,
+	error:  nbio.General_Error,
+}
+
+Listen_On_Socket_Outcome :: union #no_nil {
+	Listening_On_Socket,
+	Listener_Event_Loop_Unavailable,
+}
+
+// Takes ownership of an already bound, listening, nonblocking TCP socket created through nbio.
+// Keep the creation loop acquired until this call returns. The caller configures
+// the socket and retains ownership on failure. Call serve
+// on this same thread, including after server_shutdown, to close the socket and
+// release the one event-loop reference this call acquires.
+@(require_results)
+listen_on_socket :: proc(
+	s: ^Server,
+	socket: net.TCP_Socket,
+	opts: Server_Opts = Default_Server_Opts,
+) -> Listen_On_Socket_Outcome {
+	acquire_error := nbio.acquire_thread_event_loop()
+	// nbio also carries native errno values through General_Error.
+	if acquire_error != .None {
+		return Listener_Event_Loop_Unavailable{socket = socket, error = acquire_error}
+	}
+	_server_listener_init(s, socket, opts)
+	return Listening_On_Socket{}
+}
+
+@(private)
+_server_listener_init :: proc(s: ^Server, socket: net.TCP_Socket, opts: Server_Opts) {
+	s.opts = opts
+	s.tcp_sock = socket
+	s.conn_allocator = context.allocator
+	atomic_store(&s._listener, .Listening)
 }
 
 serve :: proc(s: ^Server, h: Handler) -> (err: net.Network_Error) {
-	if atomic_load(&s.closing) { return }
+	if atomic_load(&s.closing) {
+		switch _server_listener_close(s) {
+		case .Unbound, .Closed:
+		case .Listening, .Draining:
+			nbio.run()
+			nbio.release_thread_event_loop()
+		}
+		atomic_store(&s._shutdown_wake, .Retired)
+		return
+	}
 	s.handler = h
 
 	// Start keeping track of and caching the date for the required date header.
@@ -166,6 +218,7 @@ serve :: proc(s: ^Server, h: Handler) -> (err: net.Network_Error) {
 	thread_count := max(1, s.opts.thread_count)
 	sync.wait_group_add(&s.threads_closed, thread_count)
 	s.threads = make([]Server_Thread, thread_count, s.conn_allocator)
+	atomic_store(&s._shutdown_wake, .Published)
 	for &td in s.threads[1:] {
 		td.thread = thread.create_and_start_with_poly_data2(s, &td, _server_thread_init, context)
 	}
@@ -176,7 +229,12 @@ serve :: proc(s: ^Server, h: Handler) -> (err: net.Network_Error) {
 
 	log.debug("server threads are done, shutting down")
 
-	_server_listener_close(s)
+	switch sync.atomic_exchange(&s._shutdown_wake.raw, Server_Wake_State.Retired) {
+	case .Unpublished, .Published, .Retired:
+	case .Notifying:
+		sync.one_shot_event_wait(&s._shutdown_notified)
+	}
+	_ = _server_listener_close(s)
 	for t in s.threads[1:] { thread.destroy(t.thread) }
 	delete(s.threads)
 
@@ -195,6 +253,7 @@ listen_and_serve :: proc(
 
 _server_thread_init :: proc(s: ^Server, ttd: ^Server_Thread) {
 	td = ttd
+	defer sync.wait_group_done(&s.threads_closed)
 
 	td.conns = make(map[net.TCP_Socket]^Connection)
 	// td.free_temp_blocks = make(map[int]queue.Queue(^Block))
@@ -205,7 +264,18 @@ _server_thread_init :: proc(s: ^Server, ttd: ^Server_Thread) {
 		assert(err == nil)
 	}
 
-	td.event_loop = nbio.current_thread_event_loop()
+	sync.atomic_store(&td.event_loop, nbio.current_thread_event_loop())
+	defer {
+		// A missing loop at its owner's sole retirement means the notifier claimed
+		// it. Wait until every claimed wake finishes before releasing the loop.
+		if sync.atomic_exchange(&ttd.event_loop, nil) == nil {
+			sync.one_shot_event_wait(&s._shutdown_notified)
+		}
+		nbio.release_thread_event_loop()
+		if ttd != &s.threads[0] {
+			runtime.default_temp_allocator_destroy(auto_cast context.temp_allocator.data)
+		}
+	}
 
 	log.debug("accepting connections")
 
@@ -226,11 +296,6 @@ _server_thread_init :: proc(s: ^Server, ttd: ^Server_Thread) {
 	}
 
 	log.debug("event loop end")
-
-	if td != &s.threads[0] {
-		runtime.default_temp_allocator_destroy(auto_cast context.temp_allocator.data)
-	}
-	sync.wait_group_done(&s.threads_closed)
 }
 
 
@@ -259,25 +324,32 @@ server_shutdown :: proc(s: ^Server) {
 		// Serving threads can free the descriptor once closing is published.
 	}
 	atomic_store(&s.closing, true)
-	for t in s.threads {
-		nbio.wake_up(t.event_loop)
+	publication, _ := sync.atomic_compare_exchange_strong(&s._shutdown_wake.raw, .Published, .Notifying)
+	switch publication {
+	case .Unpublished, .Notifying, .Retired:
+		return
+	case .Published:
 	}
+	for &t in s.threads {
+		if event_loop := sync.atomic_exchange(&t.event_loop, nil); event_loop != nil {
+			nbio.wake_up(event_loop)
+		}
+	}
+	sync.one_shot_event_signal(&s._shutdown_notified)
 }
 
-@(private)
-_server_listener_close :: proc(s: ^Server) {
-	when ODIN_OS == .Linux {
-		switch sync.atomic_exchange(&s._listener.raw, Server_Listener_State.Closed) {
-		case .Unbound, .Closed:
-			return
-		case .Listening:
-			net.shutdown(s.tcp_sock, .Both)
-		case .Draining:
-		}
-	} else {
+@(private, require_results)
+_server_listener_close :: proc(s: ^Server) -> Server_Listener_State {
+	previous := sync.atomic_exchange(&s._listener.raw, Server_Listener_State.Closed)
+	switch previous {
+	case .Unbound, .Closed:
+		return previous
+	case .Listening:
 		net.shutdown(s.tcp_sock, .Both)
+	case .Draining:
 	}
 	net.close(s.tcp_sock)
+	return previous
 }
 
 _server_thread_shutdown :: proc(s: ^Server, loc := #caller_location) {
@@ -335,7 +407,6 @@ _server_thread_shutdown :: proc(s: ^Server, loc := #caller_location) {
 	}
 
 	nbio.run()
-	nbio.release_thread_event_loop()
 
 	td.state = .Closed
 
@@ -359,7 +430,7 @@ server_shutdown_on_interrupt :: proc(s: ^Server) {
 			context = on_interrupt_context
 
 			// Force close on second signal.
-			if td.state == .Closing {
+			if atomic_load(&on_interrupt_server.closing) {
 				os.exit(1)
 			}
 

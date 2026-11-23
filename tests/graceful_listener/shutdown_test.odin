@@ -1,9 +1,11 @@
 #+build linux
 package graceful_listener
 
+import "core:nbio"
 import "core:net"
 import "core:strings"
 import "core:sync"
+import "core:sys/linux"
 import "core:testing"
 import "core:thread"
 import "core:time"
@@ -15,8 +17,14 @@ Answer :: struct #all_or_none {
 	body: string,
 }
 
+Listener_Source :: enum {
+	Opened,
+	Adopted,
+}
+
 Serving_Request :: struct #all_or_none {
 	server:          http.Server,
+	listener_source: Listener_Source,
 	listening:       sync.Sema,
 	handler_entered: sync.Sema,
 	handler_return:  sync.Sema,
@@ -24,12 +32,35 @@ Serving_Request :: struct #all_or_none {
 	endpoint:        net.Endpoint,
 	listen_error:    net.Network_Error,
 	serve_error:     net.Network_Error,
+	loop_released:   bool,
 }
 
 serve_request :: proc(request: ^Serving_Request) {
 	opts := http.Default_Server_Opts
 	opts.thread_count = 1
-	request.listen_error = http.listen(&request.server, {address = net.IP4_Loopback, port = 0}, opts)
+	switch request.listener_source {
+	case .Opened:
+		request.listen_error = http.listen(&request.server, {address = net.IP4_Loopback, port = 0}, opts)
+	case .Adopted:
+		assert(nbio.acquire_thread_event_loop() == nil)
+		socket, socket_error := nbio.create_tcp_socket(.IP4)
+		assert(socket_error == nil)
+		assert(net.set_option(socket, .Reuse_Address, true) == nil)
+		reuse_port := i32(1)
+		assert(linux.setsockopt(linux.Fd(socket), linux.SOL_SOCKET, .REUSEPORT, &reuse_port) == nil)
+		assert(net.set_blocking(socket, false) == nil)
+		assert(net.bind(socket, {address = net.IP4_Loopback, port = 0}) == nil)
+		assert(linux.listen(linux.Fd(socket), 128) == nil)
+		switch outcome in http.listen_on_socket(&request.server, socket, opts) {
+		case http.Listening_On_Socket:
+		case http.Listener_Event_Loop_Unavailable:
+			net.close(outcome.socket)
+			panic("the listener's event loop could not be acquired")
+		}
+		// The adopted listener retains its own reference after the caller releases
+		// the reference it needed to create the socket.
+		nbio.release_thread_event_loop()
+	}
 	if request.listen_error != nil {
 		sync.sema_post(&request.listening)
 		return
@@ -57,11 +88,34 @@ serve_request :: proc(request: ^Serving_Request) {
 			}
 		},
 	})
+	request.loop_released = nbio.current_thread_event_loop() == nil
 }
 
 @(test)
 shutdown_refuses_new_connections_while_a_request_finishes :: proc(t: ^testing.T) {
-	request := Serving_Request{}
+	shutdown_held_request(t, .Opened)
+}
+
+@(test)
+shutdown_on_adopted_reusable_socket_finishes_the_held_request :: proc(t: ^testing.T) {
+	shutdown_held_request(t, .Adopted)
+}
+
+@(private)
+shutdown_held_request :: proc(t: ^testing.T, listener_source: Listener_Source) {
+	testing.set_fail_timeout(t, time.Second * 5)
+	request := Serving_Request{
+		server = {},
+		listener_source = listener_source,
+		listening = {},
+		handler_entered = {},
+		handler_return = {},
+		handler_count = 0,
+		endpoint = {},
+		listen_error = nil,
+		serve_error = nil,
+		loop_released = false,
+	}
 	server_thread := thread.create_and_start_with_poly_data(&request, serve_request)
 	defer thread.destroy(server_thread)
 
@@ -129,4 +183,5 @@ shutdown_refuses_new_connections_while_a_request_finishes :: proc(t: ^testing.T)
 	thread.join(server_thread)
 	testing.expect_value(t, request.handler_count, 1)
 	testing.expectf(t, request.serve_error == nil, "serve: %v", request.serve_error)
+	testing.expect(t, request.loop_released, "serve must release its listener's event-loop reference")
 }
