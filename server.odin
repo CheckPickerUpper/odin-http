@@ -70,6 +70,14 @@ Server_State :: enum {
 	Closed,
 }
 
+@(private)
+Server_Listener_State :: enum u8 {
+	Unbound,
+	Listening,
+	Draining,
+	Closed,
+}
+
 Server :: struct {
 	opts:           Server_Opts,
 	tcp_sock:       net.TCP_Socket,
@@ -83,6 +91,7 @@ Server :: struct {
 	// NOTE: This is only ever set from false to true, and checked repeatedly,
 	// so it doesn't have to be atomic, this is purely to keep the thread sanitizer happy.
 	closing:        Atomic(bool),
+	_listener:      Atomic(Server_Listener_State),
 	// Threads will decrement the wait group when they have fully closed/shutdown.
 	// The main thread waits on this to clean up global data and return.
 	threads_closed: sync.Wait_Group,
@@ -135,6 +144,10 @@ listen :: proc(
 		nbio.run()
 		nbio.release_thread_event_loop()
 		server_shutdown(s)
+	} else {
+		when ODIN_OS == .Linux {
+			atomic_store(&s._listener, .Listening)
+		}
 	}
 	return
 }
@@ -163,8 +176,7 @@ serve :: proc(s: ^Server, h: Handler) -> (err: net.Network_Error) {
 
 	log.debug("server threads are done, shutting down")
 
-	net.shutdown(s.tcp_sock, .Both)
-	net.close(s.tcp_sock)
+	_server_listener_close(s)
 	for t in s.threads[1:] { thread.destroy(t.thread) }
 	delete(s.threads)
 
@@ -197,7 +209,7 @@ _server_thread_init :: proc(s: ^Server, ttd: ^Server_Thread) {
 
 	log.debug("accepting connections")
 
-	td.accept = nbio.accept_poly(s.tcp_sock, s, on_accept)
+	_server_thread_accept(s)
 
 	log.debug("starting event loop")
 	td.state = .Serving
@@ -228,19 +240,44 @@ SHUTDOWN_INTERVAL :: time.Millisecond * 100
 
 // Starts a graceful shutdown.
 //
-// Some error logs will be generated but all active connections are finished
-// before closing them and all connections and threads are freed.
-//
-// 1. Stops 'server_start' from accepting new connections.
-// 2. Close and free non-active connections.
-// 3. Repeat 2 every SHUTDOWN_INTERVAL until no more connections are open.
-// 4. Close the main socket.
-// 5. Signal 'server_start' it can return.
+// Serving threads finish active requests, close idle connections, and free the
+// remaining server resources before serve returns. On Linux, the listener stops
+// accepting connections before draining active requests.
 server_shutdown :: proc(s: ^Server) {
+	when ODIN_OS == .Linux {
+		listener, _ := sync.atomic_compare_exchange_strong(&s._listener.raw, .Listening, .Draining)
+		switch listener {
+		case .Unbound:
+			atomic_store(&s.closing, true)
+			return
+		case .Draining, .Closed:
+			return
+		case .Listening:
+		}
+
+		net.shutdown(s.tcp_sock, .Both)
+		// Serving threads can free the descriptor once closing is published.
+	}
 	atomic_store(&s.closing, true)
 	for t in s.threads {
 		nbio.wake_up(t.event_loop)
 	}
+}
+
+@(private)
+_server_listener_close :: proc(s: ^Server) {
+	when ODIN_OS == .Linux {
+		switch sync.atomic_exchange(&s._listener.raw, Server_Listener_State.Closed) {
+		case .Unbound, .Closed:
+			return
+		case .Listening:
+			net.shutdown(s.tcp_sock, .Both)
+		case .Draining:
+		}
+	} else {
+		net.shutdown(s.tcp_sock, .Both)
+	}
+	net.close(s.tcp_sock)
 }
 
 _server_thread_shutdown :: proc(s: ^Server, loc := #caller_location) {
@@ -276,8 +313,14 @@ _server_thread_shutdown :: proc(s: ^Server, loc := #caller_location) {
 			}
 		}
 
-		if len(td.conns) == 0 {
-			break
+		when ODIN_OS == .Linux {
+			if len(td.conns) == 0 && td.accept == nil {
+				break
+			}
+		} else {
+			if len(td.conns) == 0 {
+				break
+			}
 		}
 
 		err := nbio.tick()
@@ -286,8 +329,10 @@ _server_thread_shutdown :: proc(s: ^Server, loc := #caller_location) {
 
 	td.state = .Cleaning
 
-	nbio.remove(td.accept)
-	td.accept = nil
+	when ODIN_OS != .Linux {
+		nbio.remove(td.accept)
+		td.accept = nil
+	}
 
 	nbio.run()
 	nbio.release_thread_event_loop()
@@ -412,15 +457,38 @@ connection_close :: proc(c: ^Connection, loc := #caller_location) {
 }
 
 @(private)
+_server_thread_accept :: proc(server: ^Server) {
+	when ODIN_OS == .Linux {
+		switch atomic_load(&server._listener) {
+		case .Unbound, .Draining, .Closed:
+			return
+		case .Listening:
+		}
+	}
+	td.accept = nbio.accept_poly(server.tcp_sock, server, on_accept)
+}
+
+@(private)
 on_accept :: proc(op: ^nbio.Operation, server: ^Server) {
 	td.accept = nil
+
+	when ODIN_OS == .Linux {
+		switch atomic_load(&server._listener) {
+		case .Unbound, .Draining, .Closed:
+			if op.accept.err == nil {
+				net.close(op.accept.client)
+			}
+			return
+		case .Listening:
+		}
+	}
 
 	if op.accept.err != nil {
 		#partial switch op.accept.err {
 		case .Insufficient_Resources:
 			log.error("Connection limit reached, trying again in a bit")
 			nbio.timeout_poly(time.Second, server, proc(_: ^nbio.Operation, server: ^Server) {
-				td.accept = nbio.accept_poly(server.tcp_sock, server, on_accept)
+				_server_thread_accept(server)
 			})
 			return
 		}
@@ -429,7 +497,7 @@ on_accept :: proc(op: ^nbio.Operation, server: ^Server) {
 	}
 
 	// Accept next connection.
-	td.accept = nbio.accept_poly(server.tcp_sock, server, on_accept)
+	_server_thread_accept(server)
 
 	c := new(Connection, server.conn_allocator)
 	c.state = .New
