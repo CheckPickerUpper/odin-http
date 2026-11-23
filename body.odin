@@ -153,38 +153,36 @@ _body_error_from_scanner :: proc(err: bufio.Scanner_Error) -> Body_Error {
 _body_length :: proc(req: ^Request, max_length: int = -1, user_data: rawptr, cb: Body_Callback) {
 	req._body_ok = false
 
-	len, ok := headers_get_unsafe(req.headers, "content-length")
-	if !ok {
-		cb(user_data, "", nil)
-		return
+	body_length := 0
+	if declared_length, present := headers_get_unsafe(req.headers, "content-length"); present {
+		parsed_length, length_read := strconv.parse_int(declared_length, 10)
+		if !length_read || parsed_length < 0 {
+			cb(user_data, "", .Bad_Read_Count)
+			return
+		}
+		body_length = parsed_length
 	}
 
-	ilen, lenok := strconv.parse_int(len, 10)
-	if !lenok || ilen < 0 {
-		cb(user_data, "", .Bad_Read_Count)
-		return
-	}
-
-	if max_length > -1 && ilen > max_length {
+	if max_length > -1 && body_length > max_length {
 		cb(user_data, "", Body_Size_Error{
 			max_length      = max_length,
 			consumed_length = 0,
-			next_length     = ilen,
+			next_length     = body_length,
 			framing         = .Content_Length,
 		})
 		return
 	}
 
-	if ilen == 0 {
+	if body_length == 0 {
 		req._body_ok = true
 		cb(user_data, "", nil)
 		return
 	}
 
-	req._scanner.max_token_size = ilen
+	req._scanner.max_token_size = body_length
 
 	req._scanner.split          = scan_num_bytes
-	req._scanner.split_data     = rawptr(uintptr(ilen))
+	req._scanner.split_data     = rawptr(uintptr(body_length))
 
 	req._body_ok = true
 	Length_State :: struct {
