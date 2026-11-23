@@ -156,6 +156,9 @@ serve :: proc(s: ^Server, h: Handler) -> (err: net.Network_Error) {
 	if atomic_load(&s.closing) { return }
 	s.handler = h
 
+	// Start keeping track of and caching the date for the required date header.
+	server_date_start(s)
+
 	if s.opts.thread_count == 0 {
 		s.opts.thread_count = os.get_processor_core_count()
 	}
@@ -166,9 +169,6 @@ serve :: proc(s: ^Server, h: Handler) -> (err: net.Network_Error) {
 	for &td in s.threads[1:] {
 		td.thread = thread.create_and_start_with_poly_data2(s, &td, _server_thread_init, context)
 	}
-
-	// Start keeping track of and caching the date for the required date header.
-	server_date_start(s)
 
 	_server_thread_init(s, &s.threads[0])
 
