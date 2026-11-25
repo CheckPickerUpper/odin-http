@@ -236,7 +236,7 @@ serve :: proc(s: ^Server, h: Handler) -> (err: net.Network_Error) {
 	}
 	_ = _server_listener_close(s)
 	for t in s.threads[1:] { thread.destroy(t.thread) }
-	delete(s.threads)
+	delete(s.threads, s.conn_allocator)
 
 	return nil
 }
