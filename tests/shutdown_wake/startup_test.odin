@@ -4,7 +4,6 @@ package shutdown_wake
 import "base:runtime"
 
 import "core:c/libc"
-import "core:log"
 import "core:mem"
 import "core:nbio"
 import "core:net"
@@ -71,7 +70,6 @@ Thread_Startup_Gate :: struct #all_or_none {
 	allocations_until_pause: int,
 	entered:                 sync.One_Shot_Event,
 	resume:                  sync.One_Shot_Event,
-	loop_published:          sync.One_Shot_Event,
 }
 
 Serving_Startup :: struct #all_or_none {
@@ -79,7 +77,7 @@ Serving_Startup :: struct #all_or_none {
 	gate:         Thread_Startup_Gate,
 	endpoint:     net.Endpoint,
 	listen_error: net.Network_Error,
-	serve_error:  net.Network_Error,
+	serve_error:  http.Server_Error,
 }
 
 pause_thread_allocation :: proc(
@@ -113,20 +111,6 @@ pause_thread_allocation :: proc(
 	)
 }
 
-observe_loop_publication :: proc(
-	data: rawptr,
-	_: log.Level,
-	message: string,
-	_: log.Options,
-	_: runtime.Source_Code_Location = #caller_location,
-) {
-	// The native startup message precedes the first tick of its published loop.
-	if message == "starting event loop" {
-		gate := cast(^Thread_Startup_Gate)data
-		sync.one_shot_event_signal(&gate.loop_published)
-	}
-}
-
 serve_startup :: proc(startup: ^Serving_Startup) {
 	opts := http.Default_Server_Opts
 	opts.thread_count = 3
@@ -143,15 +127,11 @@ serve_startup :: proc(startup: ^Serving_Startup) {
 	// Thread creation pauses after serve allocates its thread slice. The listener
 	// and all allocations still use the real heap allocator.
 	context.allocator = mem.Allocator{procedure = pause_thread_allocation, data = &startup.gate}
-	context.logger = log.Logger{
-		procedure = observe_loop_publication,
-		data = &startup.gate,
-		lowest_level = .Debug,
-		options = {},
-	}
 	startup.serve_error = http.serve(&startup.server, http.handler(proc(_: ^http.Request, res: ^http.Response) {
 		http.respond_plain(res, "ready")
 	}))
+	// A failed spawn makes serve return before the paused spawn.
+	sync.one_shot_event_signal(&startup.gate.entered)
 }
 
 @(test)
@@ -171,7 +151,6 @@ shutdown_before_and_during_thread_startup_refuses_connections_and_finishes :: pr
 				allocations_until_pause = started_threads + 1,
 				entered = {},
 				resume = {},
-				loop_published = {},
 			},
 			endpoint = {},
 			listen_error = nil,
@@ -182,11 +161,13 @@ shutdown_before_and_during_thread_startup_refuses_connections_and_finishes :: pr
 		defer sync.one_shot_event_signal(&startup.gate.resume)
 
 		sync.one_shot_event_wait(&startup.gate.entered)
+		// No spawned thread serves before serve spawned every thread, so when the shutdown begins no
+		// thread serves or has published its loop.
 		if !testing.expectf(t, startup.listen_error == nil, "listen: %v", startup.listen_error) {
 			return
 		}
-		if started_threads > 0 {
-			sync.one_shot_event_wait(&startup.gate.loop_published)
+		if !testing.expectf(t, startup.gate.allocations_until_pause == 0, "serve returned before it spawned thread %d: %v", started_threads + 1, startup.serve_error) {
+			return
 		}
 
 		http.server_shutdown(&startup.server)
@@ -194,11 +175,13 @@ shutdown_before_and_during_thread_startup_refuses_connections_and_finishes :: pr
 		if dial_error == nil {
 			net.close(socket)
 		}
-		testing.expectf(t, dial_error == net.Dial_Error.Refused, "connection after %d threads started and shutdown began: %v", started_threads, dial_error)
+		testing.expectf(t, dial_error == net.Dial_Error.Refused,
+			"connection after shutdown began as serve spawned thread %d, before any thread served or published its loop: %v",
+			started_threads + 1, dial_error)
 
 		sync.one_shot_event_signal(&startup.gate.resume)
 		thread.join(server_thread)
-		testing.expectf(t, startup.serve_error == nil, "serve after %d threads started: %v", started_threads, startup.serve_error)
+		testing.expectf(t, startup.serve_error == nil, "serve after shutdown began as it spawned thread %d: %v", started_threads + 1, startup.serve_error)
 		http.server_shutdown(&startup.server)
 	}
 }

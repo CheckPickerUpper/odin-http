@@ -1,14 +1,14 @@
 #+build linux
 package server_tests
 
-import "core:net"
+import http "../.."
 
 Listen_Failed :: struct #all_or_none {
-	error: net.Network_Error,
+	error: http.Server_Error,
 }
 
 Serve_Returned :: struct #all_or_none {
-	error: net.Network_Error,
+	error: http.Server_Error,
 }
 
 Server_Return :: union #no_nil {

@@ -86,6 +86,14 @@ Server_Wake_State :: enum u8 {
 	Retired,
 }
 
+@(private)
+Server_Startup :: enum {
+	// Every server thread was spawned.
+	Serving,
+	// A server thread could not be spawned. The threads already spawned return without serving.
+	Abandoned,
+}
+
 Server :: struct {
 	opts:           Server_Opts,
 	tcp_sock:       net.TCP_Socket,
@@ -100,9 +108,14 @@ Server :: struct {
 	_shutdown_wake: Atomic(Server_Wake_State),
 	// Claimed loops and the thread slice stay live until notification finishes.
 	_shutdown_notified: sync.One_Shot_Event,
+	// Signalled by the server_shutdown that drains the listener once it no longer uses the socket.
+	_listener_drained: sync.One_Shot_Event,
 	// Threads will decrement the wait group when they have fully closed/shutdown.
 	// The main thread waits on this to clean up global data and return.
 	threads_closed: sync.Wait_Group,
+	// Signalled once serve stopped spawning threads; `startup` then says whether they serve.
+	startup_done:   sync.One_Shot_Event,
+	startup:        Server_Startup,
 
 	// Updated every second with an updated date, this speeds up the server considerably
 	// because it would otherwise need to call time.now() and format the date on each response.
@@ -131,6 +144,19 @@ td: ^Server_Thread
 Default_Endpoint := net.Endpoint {
 	address = net.IP4_Any,
 	port    = 8080,
+}
+
+Server_Thread_Error :: enum {
+	None,
+	// Creating a server thread failed. serve joins the threads it spawned, none of which served,
+	// and releases what listen acquired before returning.
+	Spawn_Failed,
+}
+
+// The errors listen and serve return.
+Server_Error :: union #shared_nil {
+	net.Network_Error,
+	Server_Thread_Error,
 }
 
 listen :: proc(
@@ -195,50 +221,93 @@ _server_listener_init :: proc(s: ^Server, socket: net.TCP_Socket, opts: Server_O
 	atomic_store(&s._listener, .Listening)
 }
 
-serve :: proc(s: ^Server, h: Handler) -> (err: net.Network_Error) {
+serve :: proc(s: ^Server, h: Handler) -> (err: Server_Error) {
 	if atomic_load(&s.closing) {
-		switch _server_listener_close(s) {
-		case .Unbound, .Closed:
-		case .Listening, .Draining:
-			nbio.run()
-			nbio.release_thread_event_loop()
-		}
+		_server_listen_release(s)
 		atomic_store(&s._shutdown_wake, .Retired)
 		return
 	}
 	s.handler = h
-
-	// Start keeping track of and caching the date for the required date header.
-	server_date_start(s)
 
 	if s.opts.thread_count == 0 {
 		s.opts.thread_count = os.get_processor_core_count()
 	}
 
 	thread_count := max(1, s.opts.thread_count)
-	sync.wait_group_add(&s.threads_closed, thread_count)
 	s.threads = make([]Server_Thread, thread_count, s.conn_allocator)
 	atomic_store(&s._shutdown_wake, .Published)
+
+	spawned := 0
+	startup := Server_Startup.Serving
 	for &td in s.threads[1:] {
-		td.thread = thread.create_and_start_with_poly_data2(s, &td, _server_thread_init, context)
+		td.thread = thread.create_and_start_with_poly_data2(s, &td, _server_thread_start, context)
+		if td.thread == nil {
+			err = Server_Thread_Error.Spawn_Failed
+			startup = .Abandoned
+			break
+		}
+		spawned += 1
 	}
 
-	_server_thread_init(s, &s.threads[0])
+	s.startup = startup
+	switch startup {
+	case .Serving:
+		sync.wait_group_add(&s.threads_closed, thread_count)
+		// Start keeping track of and caching the date for the required date header, before any
+		// thread serves.
+		server_date_start(s)
+		sync.one_shot_event_signal(&s.startup_done)
 
-	sync.wait(&s.threads_closed)
+		_server_thread_init(s, &s.threads[0])
 
-	log.debug("server threads are done, shutting down")
+		sync.wait(&s.threads_closed)
 
+		log.debug("server threads are done, shutting down")
+
+		_server_wake_retire(s)
+		_ = _server_listener_close(s)
+	case .Abandoned:
+		// A later serve call returns at once, as it does after a failed listen.
+		server_shutdown(s)
+		sync.one_shot_event_signal(&s.startup_done)
+		switch atomic_load(&s._listener) {
+		case .Draining:
+			// The server_shutdown that drains the listener, this one or one that began during
+			// startup, may still be shutting the socket down.
+			sync.one_shot_event_wait(&s._listener_drained)
+		case .Unbound, .Listening, .Closed:
+		}
+		_server_wake_retire(s)
+		_server_listen_release(s)
+	}
+
+	for t in s.threads[1:][:spawned] { thread.destroy(t.thread) }
+	delete(s.threads, s.conn_allocator)
+
+	return
+}
+
+// Ends shutdown wake publication, after a server_shutdown that claimed the threads' loops has
+// finished waking them.
+@(private)
+_server_wake_retire :: proc(s: ^Server) {
 	switch sync.atomic_exchange(&s._shutdown_wake.raw, Server_Wake_State.Retired) {
 	case .Unpublished, .Published, .Retired:
 	case .Notifying:
 		sync.one_shot_event_wait(&s._shutdown_notified)
 	}
-	_ = _server_listener_close(s)
-	for t in s.threads[1:] { thread.destroy(t.thread) }
-	delete(s.threads, s.conn_allocator)
+}
 
-	return nil
+// Closes the socket listen opened and releases the event loop reference listen acquired,
+// for a serve that returns without serving.
+@(private)
+_server_listen_release :: proc(s: ^Server) {
+	switch _server_listener_close(s) {
+	case .Unbound, .Closed:
+	case .Listening, .Draining:
+		nbio.run()
+		nbio.release_thread_event_loop()
+	}
 }
 
 listen_and_serve :: proc(
@@ -246,9 +315,20 @@ listen_and_serve :: proc(
 	h: Handler,
 	endpoint: net.Endpoint = Default_Endpoint,
 	opts: Server_Opts = Default_Server_Opts,
-) -> (err: net.Network_Error) {
+) -> (err: Server_Error) {
 	listen(s, endpoint, opts) or_return
 	return serve(s, h)
+}
+
+// Runs on each spawned server thread, which serves once serve spawned every other thread.
+@(private)
+_server_thread_start :: proc(s: ^Server, ttd: ^Server_Thread) {
+	sync.one_shot_event_wait(&s.startup_done)
+	switch s.startup {
+	case .Serving:
+		_server_thread_init(s, ttd)
+	case .Abandoned:
+	}
 }
 
 _server_thread_init :: proc(s: ^Server, ttd: ^Server_Thread) {
@@ -321,6 +401,7 @@ server_shutdown :: proc(s: ^Server) {
 		}
 
 		net.shutdown(s.tcp_sock, .Both)
+		sync.one_shot_event_signal(&s._listener_drained)
 		// Serving threads can free the descriptor once closing is published.
 	}
 	atomic_store(&s.closing, true)
