@@ -37,7 +37,7 @@ Server_Opts :: struct {
 	// The HTTP spec does not specify any limits but in practice it is safer.
 	// defaults to 8000.
 	limit_headers:           int,
-	// The thread count to use, defaults to your core count - 1.
+	// The thread count to use, defaults to your core count.
 	thread_count:            int,
 
 	// // The initial size of the temp_allocator for each connection, defaults to 256KiB and doubles
@@ -88,9 +88,10 @@ Server_Wake_State :: enum u8 {
 
 @(private)
 Server_Startup :: enum {
-	// Every server thread was spawned.
+	// Every server thread was spawned and acquired its event loop.
 	Serving,
-	// A server thread could not be spawned. The threads already spawned return without serving.
+	// A server thread could not be spawned or could not acquire its event loop. The threads that
+	// acquired theirs release them without serving.
 	Abandoned,
 }
 
@@ -128,6 +129,9 @@ Server_Thread :: struct {
 	conns:      map[net.TCP_Socket]^Connection,
 	state:      Server_State,
 	accept:     ^nbio.Operation,
+	// Signalled by a spawned thread once it acquired its event loop or stored why it could not in `loop_error`.
+	reported:   sync.One_Shot_Event,
+	loop_error: nbio.General_Error,
 
 	// free_temp_blocks:       map[int]queue.Queue(^Block),
 	// free_temp_blocks_count: int,
@@ -153,20 +157,24 @@ Server_Thread_Error :: enum {
 	Spawn_Failed,
 }
 
-// The errors listen and serve return.
+// The errors listen and serve return. A `nbio.General_Error` is a failed event loop acquire: of the
+// calling thread in listen, or of a server thread in serve. serve then joins the threads it spawned,
+// none of which served, and releases every event loop reference they and listen acquired.
 Server_Error :: union #shared_nil {
 	net.Network_Error,
 	Server_Thread_Error,
+	nbio.General_Error,
 }
 
 listen :: proc(
 	s: ^Server,
 	endpoint: net.Endpoint = Default_Endpoint,
 	opts: Server_Opts = Default_Server_Opts,
-) -> net.Network_Error {
-	acquire_err := nbio.acquire_thread_event_loop()
-	// TODO: error handling.
-	assert(acquire_err == nil)
+) -> Server_Error {
+	if acquire_err := nbio.acquire_thread_event_loop(); acquire_err != .None {
+		server_shutdown(s)
+		return acquire_err
+	}
 
 	socket, listen_error := nbio.listen_tcp(endpoint)
 	if listen_error != nil {
@@ -237,6 +245,8 @@ serve :: proc(s: ^Server, h: Handler) -> (err: Server_Error) {
 	s.threads = make([]Server_Thread, thread_count, s.conn_allocator)
 	atomic_store(&s._shutdown_wake, .Published)
 
+	// Each thread acquires its event loop before serve spawns the next one, so the first failure
+	// stops spawning and serve returns that thread's error.
 	spawned := 0
 	startup := Server_Startup.Serving
 	for &td in s.threads[1:] {
@@ -247,6 +257,12 @@ serve :: proc(s: ^Server, h: Handler) -> (err: Server_Error) {
 			break
 		}
 		spawned += 1
+		sync.one_shot_event_wait(&td.reported)
+		if td.loop_error != .None {
+			err = td.loop_error
+			startup = .Abandoned
+			break
+		}
 	}
 
 	s.startup = startup
@@ -320,14 +336,24 @@ listen_and_serve :: proc(
 	return serve(s, h)
 }
 
-// Runs on each spawned server thread, which serves once serve spawned every other thread.
+// Runs on each spawned server thread: acquires the thread's event loop, reports the result to serve,
+// and serves once every other thread acquired its loop.
 @(private)
 _server_thread_start :: proc(s: ^Server, ttd: ^Server_Thread) {
+	if acquire_err := nbio.acquire_thread_event_loop(); acquire_err != .None {
+		ttd.loop_error = acquire_err
+		sync.one_shot_event_signal(&ttd.reported)
+		return
+	}
+	sync.one_shot_event_signal(&ttd.reported)
+
 	sync.one_shot_event_wait(&s.startup_done)
 	switch s.startup {
 	case .Serving:
 		_server_thread_init(s, ttd)
 	case .Abandoned:
+		// This thread never serves, so the release in _server_thread_init's defer never runs for it.
+		nbio.release_thread_event_loop()
 	}
 }
 
@@ -337,12 +363,6 @@ _server_thread_init :: proc(s: ^Server, ttd: ^Server_Thread) {
 
 	td.conns = make(map[net.TCP_Socket]^Connection)
 	// td.free_temp_blocks = make(map[int]queue.Queue(^Block))
-
-	if td != &s.threads[0] {
-		err := nbio.acquire_thread_event_loop()
-		// TODO: error handling.
-		assert(err == nil)
-	}
 
 	sync.atomic_store(&td.event_loop, nbio.current_thread_event_loop())
 	defer {

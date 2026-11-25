@@ -32,7 +32,7 @@ serve_while_spawns_fail :: proc(t: ^testing.T, before: Process_Resources) {
 	})
 
 	serve_error := http.serve(&server, handler)
-	second_spawns := Thread_Spawns{backing = context.allocator, count = 0}
+	second_spawns := Thread_Spawns{backing = context.allocator, count = 0, shutdown = nil}
 	second_serve_error: http.Server_Error
 	{
 		context.allocator = thread_spawns_allocator(&second_spawns)

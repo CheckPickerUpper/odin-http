@@ -76,7 +76,7 @@ Serving_Startup :: struct #all_or_none {
 	server:       http.Server,
 	gate:         Thread_Startup_Gate,
 	endpoint:     net.Endpoint,
-	listen_error: net.Network_Error,
+	listen_error: http.Server_Error,
 	serve_error:  http.Server_Error,
 }
 
@@ -130,7 +130,8 @@ serve_startup :: proc(startup: ^Serving_Startup) {
 	startup.serve_error = http.serve(&startup.server, http.handler(proc(_: ^http.Request, res: ^http.Response) {
 		http.respond_plain(res, "ready")
 	}))
-	// A failed spawn makes serve return before the paused spawn.
+	// A failed spawn, or a spawned thread that cannot acquire its event loop, makes serve return before
+	// the paused spawn.
 	sync.one_shot_event_signal(&startup.gate.entered)
 }
 

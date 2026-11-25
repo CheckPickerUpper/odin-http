@@ -30,7 +30,7 @@ Serving_Request :: struct #all_or_none {
 	handler_return:  sync.Sema,
 	handler_count:   int,
 	endpoint:        net.Endpoint,
-	listen_error:    net.Network_Error,
+	listen_error:    http.Server_Error,
 	serve_error:     http.Server_Error,
 	loop_released:   bool,
 }
