@@ -1,3 +1,4 @@
+#+build linux
 package server_tests
 
 import "core:mem"
@@ -38,6 +39,8 @@ serve_with_separate_allocators :: proc(run: ^Separate_Allocators_Run) {
 @(test)
 serve_frees_its_threads_with_the_allocator_that_made_them :: proc(t: ^testing.T) {
 	testing.set_fail_timeout(t, time.Second * 10)
+	sync.mutex_lock(&process_resources_lock)
+	defer sync.mutex_unlock(&process_resources_lock)
 
 	run := new(Separate_Allocators_Run)
 	defer free(run)

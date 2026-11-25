@@ -1,3 +1,4 @@
+#+build linux
 package server_tests
 
 import "core:net"
