@@ -39,6 +39,9 @@ Server_Opts :: struct {
 	limit_headers:           int,
 	// The thread count to use, defaults to your core count.
 	thread_count:            int,
+	// Called on the retiring thread before it releases the event loop. Receives the handler's
+	// user data and the tick failure, or .None after the loop drains during shutdown.
+	on_event_loop_retire:    proc(user_data: rawptr, cause: nbio.General_Error),
 
 	// // The initial size of the temp_allocator for each connection, defaults to 256KiB and doubles
 	// // each time it needs to grow.
@@ -383,18 +386,24 @@ _server_thread_init :: proc(s: ^Server, ttd: ^Server_Thread) {
 
 	log.debug("starting event loop")
 	td.state = .Serving
+	retirement_cause: nbio.General_Error
 	for {
-		if atomic_load(&s.closing) { _server_thread_shutdown(s) }
-		if td.state == .Closed { break }
-		if td.state == .Cleaning { continue }
-
-		err := nbio.tick()
-		if err != nil {
-			log.errorf("non-blocking io tick error: %v", err)
+		if atomic_load(&s.closing) {
+			retirement_cause = _server_thread_shutdown(s)
 			break
 		}
+		retirement_cause = nbio.tick()
+		if retirement_cause != .None { break }
 	}
 
+	if notify := s.opts.on_event_loop_retire; notify != nil {
+		notify(s.handler.user_data, retirement_cause)
+	} else if td.state == .Closing {
+		fmt.assertf(retirement_cause == .None, "IO tick error during shutdown: %v", retirement_cause)
+	}
+	if td.state != .Closed && retirement_cause != .None {
+		log.errorf("non-blocking io tick error: %v", retirement_cause)
+	}
 	log.debug("event loop end")
 }
 
@@ -453,7 +462,7 @@ _server_listener_close :: proc(s: ^Server) -> Server_Listener_State {
 	return previous
 }
 
-_server_thread_shutdown :: proc(s: ^Server, loc := #caller_location) {
+_server_thread_shutdown :: proc(s: ^Server, loc := #caller_location) -> nbio.General_Error {
 	assert_has_td(loc)
 
 	td.state = .Closing
@@ -496,8 +505,9 @@ _server_thread_shutdown :: proc(s: ^Server, loc := #caller_location) {
 			}
 		}
 
-		err := nbio.tick()
-		fmt.assertf(err == nil, "IO tick error during shutdown: %v")
+		if cause := nbio.tick(); cause != .None {
+			return cause
+		}
 	}
 
 	td.state = .Cleaning
@@ -507,11 +517,12 @@ _server_thread_shutdown :: proc(s: ^Server, loc := #caller_location) {
 		td.accept = nil
 	}
 
-	nbio.run()
+	cause := nbio.run()
 
 	td.state = .Closed
 
-	log.info("shutdown: done")
+	if cause == .None || s.opts.on_event_loop_retire == nil { log.info("shutdown: done") }
+	return cause
 }
 
 @(private)
